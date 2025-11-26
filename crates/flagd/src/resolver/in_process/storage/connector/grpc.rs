@@ -1,16 +1,16 @@
 use super::{Connector, QueuePayload, QueuePayloadType};
-use crate::flagd::sync::v1::{flag_sync_service_client::FlagSyncServiceClient, SyncFlagsRequest};
-use crate::resolver::common::upstream::UpstreamConfig;
 use crate::FlagdOptions;
+use crate::flagd::sync::v1::{SyncFlagsRequest, flag_sync_service_client::FlagSyncServiceClient};
+use crate::resolver::common::upstream::UpstreamConfig;
 use anyhow::{Context, Result};
 use std::str::FromStr;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::time::sleep;
 use tonic::transport::{Channel, Uri};
 use tracing::{debug, error, warn};
@@ -28,7 +28,8 @@ pub struct GrpcStreamConnector {
     retry_backoff_max_ms: u32,
     retry_grace_period: u32,
     stream_deadline_ms: u32,
-    authority: String, // desired authority, e.g. "b-features-api.service"
+    authority: String,   // desired authority, e.g. "b-features-api.service"
+    provider_id: String, // provider identifier for sync requests
 }
 
 impl GrpcStreamConnector {
@@ -52,6 +53,10 @@ impl GrpcStreamConnector {
             retry_grace_period: options.retry_grace_period,
             stream_deadline_ms: options.stream_deadline_ms,
             authority,
+            provider_id: options
+                .provider_id
+                .clone()
+                .unwrap_or_else(|| "rust-flagd-provider".to_string()),
         }
     }
 
@@ -119,7 +124,7 @@ impl GrpcStreamConnector {
         // Create the gRPC client with no interceptor because the endpoint already carries the desired authority.
         let mut client = FlagSyncServiceClient::new(channel);
         let request = tonic::Request::new(SyncFlagsRequest {
-            provider_id: "rust-flagd-provider".to_string(),
+            provider_id: self.provider_id.clone(),
             selector: self.selector.clone().unwrap_or_default(),
         });
         debug!("Sending sync request with selector: {:?}", self.selector);
@@ -210,45 +215,41 @@ impl Connector for GrpcStreamConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resolver::common::upstream::UpstreamConfig;
     use crate::FlagdOptions;
+    use crate::resolver::common::upstream::UpstreamConfig;
     use serial_test::serial;
     use test_log::test;
+    use tokio::net::TcpListener;
     use tokio::time::Instant;
 
     #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
     #[serial]
     async fn test_retry_mechanism_inprocess() {
-        // Create options configured for a failing connection.
-        let options = FlagdOptions {
-            host: "invalid-host".to_string(),
-            resolver_type: crate::ResolverType::InProcess,
-            port: 4444,
-            target_uri: None,
-            deadline_ms: 500,
-            retry_backoff_ms: 100,
-            retry_backoff_max_ms: 400,
-            retry_grace_period: 3,
-            stream_deadline_ms: 500,
-            tls: false,
-            cert_path: None,
-            selector: None,
-            socket_path: None,
-            cache_settings: None,
-            source_configuration: None,
-            offline_poll_interval_ms: None,
-        };
+        // Bind to a port but don't accept connections - this causes immediate connection failures
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Drop the listener immediately to ensure the port rejects connections
+        drop(listener);
 
-        let connector = GrpcStreamConnector::new(
-            "invalid-host".to_string(),
-            None,
-            &options,
-            "invalid-authority".to_string(),
-        );
+        // Create options configured for a failing connection.
+        let mut options = FlagdOptions::default();
+        options.host = addr.ip().to_string();
+        options.resolver_type = crate::ResolverType::InProcess;
+        options.port = addr.port();
+        options.deadline_ms = 100; // Short timeout for fast failures
+        options.retry_backoff_ms = 100;
+        options.retry_backoff_max_ms = 400;
+        options.retry_grace_period = 3;
+        options.stream_deadline_ms = 500;
+        options.tls = false;
+        options.cache_settings = None;
+
+        let target = format!("{}:{}", addr.ip(), addr.port());
+        let connector =
+            GrpcStreamConnector::new(target.clone(), None, &options, "test-authority".to_string());
 
         // Create an upstream configuration with the invalid target.
-        let config = UpstreamConfig::new(connector.target.clone(), true)
-            .expect("failed to create upstream config");
+        let config = UpstreamConfig::new(target, false).expect("failed to create upstream config");
 
         let start = Instant::now();
         let result = connector.connect_with_timeout_using(&config).await;
@@ -264,10 +265,7 @@ mod tests {
             elapsed.as_millis()
         );
         assert!(
-            // This is a little flaky, it runs as expected time to time
-            // elapsed time is higher than 600ms, I assume it is either due
-            // test environment or async to serial doesn't work as expected
-            elapsed.as_millis() < 700,
+            elapsed.as_millis() < 600,
             "Elapsed time {}ms is too high",
             elapsed.as_millis()
         );
