@@ -175,7 +175,8 @@ impl RpcResolver {
             .target_uri
             .clone()
             .unwrap_or_else(|| format!("{}:{}", options.host, options.port));
-        let upstream_config = UpstreamConfig::new(target.replace("http://", ""), false)?;
+        let upstream_config =
+            UpstreamConfig::new(target, false, options.tls, options.cert_path.as_deref())?;
         let mut endpoint = upstream_config.endpoint().clone();
 
         // Extend support for envoy names resolution
@@ -482,7 +483,7 @@ mod tests {
             &self,
             _request: Request<EventStreamRequest>,
         ) -> Result<Response<Self::EventStreamStream>, Status> {
-            let output = futures::stream::empty();
+            let output = tokio_stream::empty();
             Ok(Response::new(Box::pin(output)))
         }
     }
